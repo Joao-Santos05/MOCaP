@@ -4,6 +4,8 @@ Módulo: etl_genetico.py
 Fase 1: Pipeline de ETL e Esqueleto do Algoritmo Genético (DEAP)
 """
 
+from __future__ import annotations
+
 import os
 import random
 import numpy as np
@@ -11,7 +13,16 @@ import pandas as pd
 from deap import base, creator, tools
 
 # Importação do mock nutricional e constantes de restrição
-from nutricao_mock import TABELA_NUTRICIONAL, META_CALORIAS, META_PROTEINAS
+from nutricao_mock import (
+    TABELA_NUTRICIONAL,
+    META_CALORIAS,
+    META_PROTEINAS,
+    LOW_BOUNDS,
+    UP_BOUNDS,
+    TETO_CALORIAS_VAZIAS,
+    PRODUTOS_CALORIAS_VAZIAS,
+    RAZAO_ARROZ_FEIJAO,
+)
 
 # Lista ordenada de produtos para correspondência biunívoca gene <-> produto
 PRODUTOS = list(TABELA_NUTRICIONAL.keys())
@@ -124,6 +135,59 @@ def carregar_dados_icb(
 # =====================================================================
 # 2. Função de Avaliação com Penalidade Adaptativa Progressiva
 # =====================================================================
+def calcular_metricas_nutricionais(
+    individuo: list[int],
+    meta_calorias: float = META_CALORIAS,
+    meta_proteinas: float = META_PROTEINAS
+) -> dict:
+    """
+    Calcula os totais nutricionais de uma cesta e o déficit nutricional relativo
+    normalizado (delta_nutricional), que acumula as violações das 4 regras:
+      1. Meta calórica mínima:   calorias >= meta_calorias
+      2. Meta proteica mínima:   proteinas >= meta_proteinas
+      3. Teto de calorias vazias: (cal_Açúcar + cal_Óleo) <= 25% das calorias totais
+      4. Proporção cultural:     kg_Arroz >= 0,5 * kg_Feijão
+    """
+    calorias_total = 0.0
+    proteinas_total = 0.0
+    calorias_vazias = 0.0
+    for i, produto in enumerate(PRODUTOS):
+        info = TABELA_NUTRICIONAL[produto]
+        calorias_total += individuo[i] * info["calorias"]
+        proteinas_total += individuo[i] * info["proteina"]
+        if produto in PRODUTOS_CALORIAS_VAZIAS:
+            calorias_vazias += individuo[i] * info["calorias"]
+
+    deficit_cal = max(0.0, float(meta_calorias - calorias_total))
+    deficit_prot = max(0.0, float(meta_proteinas - proteinas_total))
+
+    # Excesso de calorias vazias relativo ao teto permitido
+    teto_vazias = TETO_CALORIAS_VAZIAS * calorias_total
+    excesso_vazias = max(0.0, calorias_vazias - teto_vazias)
+    rel_vazias = excesso_vazias / calorias_total if calorias_total > 0 else (1.0 if calorias_vazias > 0 else 0.0)
+
+    # Déficit da proporção cultural Arroz >= 0,5 * Feijão
+    kg_arroz = individuo[PRODUTOS.index("Arroz")]
+    kg_feijao = individuo[PRODUTOS.index("Feijão")]
+    minimo_arroz = RAZAO_ARROZ_FEIJAO * kg_feijao
+    rel_arroz = max(0.0, minimo_arroz - kg_arroz) / minimo_arroz if minimo_arroz > 0 else 0.0
+
+    delta_nutricional = (
+        (deficit_cal / meta_calorias if meta_calorias > 0 else 0.0)
+        + (deficit_prot / meta_proteinas if meta_proteinas > 0 else 0.0)
+        + rel_vazias
+        + rel_arroz
+    )
+
+    return {
+        "calorias": calorias_total,
+        "proteinas": proteinas_total,
+        "pct_calorias_vazias": (calorias_vazias / calorias_total) if calorias_total > 0 else 0.0,
+        "delta_nutricional": delta_nutricional,
+        "valido": delta_nutricional <= 0.0,
+    }
+
+
 def avaliar_cesta(
     individuo: list[int],
     precos_projetados: dict,
@@ -132,12 +196,15 @@ def avaliar_cesta(
     p_min: float = 500.0,
     p_max: float = 10000.0,
     gama: float = 2.0,
-    retornar_detalhes: bool = False
+    retornar_detalhes: bool = False,
+    meta_calorias: float = META_CALORIAS,
+    meta_proteinas: float = META_PROTEINAS
 ) -> tuple[float] | tuple[tuple[float], dict]:
     """
     Função de avaliação de fitness para o DEAP com suporte a Penalidade Adaptativa.
-    Calcula o custo total da cesta e penaliza caso os requisitos nutricionais
-    mínimos (calorias e proteínas) não sejam atendidos.
+    Calcula o custo total da cesta e penaliza caso as restrições nutricionais
+    (calorias, proteínas, teto de calorias vazias e proporção Arroz/Feijão)
+    não sejam atendidas.
 
     Mecânica de Despacho (Retrocompatibilidade):
       - Se geracao is None ou ngen is None: Aplica a penalidade estática clássica (+10.000).
@@ -154,29 +221,19 @@ def avaliar_cesta(
         p_max (float): Penalidade máxima na geração final (padrão: R$ 10.000,00).
         gama (float): Expoente de aceleração temporal (padrão: 2.0).
         retornar_detalhes (bool): Se True, retorna também métricas detalhadas.
+        meta_calorias (float): Meta calórica mensal mínima (padrão: 60.000 kcal).
+        meta_proteinas (float): Meta proteica mensal mínima (padrão: 1.500 g).
 
     Retorno:
         tuple[float] ou tuple[tuple[float], dict]
     """
     custo_total = 0.0
-    calorias_total = 0.0
-    proteinas_total = 0.0
-
     for i, produto in enumerate(PRODUTOS):
-        kg = individuo[i]
-        preco_kg = precos_projetados.get(produto, 0.0)
-        custo_total += kg * preco_kg
+        custo_total += individuo[i] * precos_projetados.get(produto, 0.0)
 
-        info_nutricional = TABELA_NUTRICIONAL[produto]
-        calorias_total += kg * info_nutricional["calorias"]
-        proteinas_total += kg * info_nutricional["proteina"]
-
-    deficit_cal = max(0.0, float(META_CALORIAS - calorias_total))
-    deficit_prot = max(0.0, float(META_PROTEINAS - proteinas_total))
-    violou = (deficit_cal > 0.0) or (deficit_prot > 0.0)
-
-    # Déficit nutricional relativo normalizado
-    delta_nutricional = (deficit_cal / META_CALORIAS) + (deficit_prot / META_PROTEINAS)
+    nutri = calcular_metricas_nutricionais(individuo, meta_calorias, meta_proteinas)
+    delta_nutricional = nutri["delta_nutricional"]
+    violou = not nutri["valido"]
 
     if violou:
         if geracao is None or ngen is None:
@@ -196,8 +253,9 @@ def avaliar_cesta(
         detalhes = {
             "custo_real": custo_total,
             "penalidade": penalidade,
-            "calorias": calorias_total,
-            "proteinas": proteinas_total,
+            "calorias": nutri["calorias"],
+            "proteinas": nutri["proteinas"],
+            "pct_calorias_vazias": nutri["pct_calorias_vazias"],
             "delta_nutricional": delta_nutricional,
             "valido": not violou
         }
@@ -216,40 +274,44 @@ if not hasattr(creator, "FitnessMin"):
 if not hasattr(creator, "Individual"):
     creator.create("Individual", list, fitness=creator.FitnessMin)
 
-def configurar_toolbox(precos_projetados: dict = None) -> base.Toolbox:
+
+def gerar_genes_heterogeneos() -> list[int]:
+    """Gera um vetor de 10 genes, cada um sorteado em [LOW_BOUNDS_i, UP_BOUNDS_i]."""
+    return [random.randint(lo, up) for lo, up in zip(LOW_BOUNDS, UP_BOUNDS)]
+
+
+def configurar_toolbox(
+    precos_projetados: dict = None,
+    meta_calorias: float = META_CALORIAS,
+    meta_proteinas: float = META_PROTEINAS
+) -> base.Toolbox:
     """
     Configura e retorna o Toolbox do DEAP com todos os operadores genéticos
     devidamente registrados:
-      - Genes: inteiros entre 0 e 20 (permitindo alternativas viáveis à carne)
+      - Genes: inteiros heterogêneos em [LOW_BOUNDS_i, UP_BOUNDS_i] (LIMITES_PRODUTOS)
       - Cruzamento: cxTwoPoint
-      - Mutação: mutUniformInt(low=0, up=20, indpb=0.2)
+      - Mutação: mutUniformInt(low=LOW_BOUNDS, up=UP_BOUNDS, indpb=0.2)
       - Seleção: selTournament(tournsize=3)
     """
     toolbox = base.Toolbox()
 
-    # Genes: KGs do produto variando de 0 a 20 (Correção 3 para evitar convergência prematura)
-    toolbox.register("attr_kg", random.randint, 0, 20)
-
-    # Indivíduo: lista de 10 genes (um para cada produto da cesta)
-    toolbox.register(
-        "individual",
-        tools.initRepeat,
-        creator.Individual,
-        toolbox.attr_kg,
-        n=len(PRODUTOS)
-    )
+    # Indivíduo: lista de 10 genes com domínio individual por produto
+    toolbox.register("individual", tools.initIterate, creator.Individual, gerar_genes_heterogeneos)
 
     # População
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 
-    # Operadores Genéticos (Correção 2 da revisão arquitetural)
+    # Operadores Genéticos
     toolbox.register("mate", tools.cxTwoPoint)
-    toolbox.register("mutate", tools.mutUniformInt, low=0, up=20, indpb=0.2)
+    toolbox.register("mutate", tools.mutUniformInt, low=LOW_BOUNDS, up=UP_BOUNDS, indpb=0.2)
     toolbox.register("select", tools.selTournament, tournsize=3)
 
     # Função de Avaliação
     if precos_projetados is not None:
-        toolbox.register("evaluate", avaliar_cesta, precos_projetados=precos_projetados)
+        toolbox.register(
+            "evaluate", avaliar_cesta, precos_projetados=precos_projetados,
+            meta_calorias=meta_calorias, meta_proteinas=meta_proteinas
+        )
 
     return toolbox
 
@@ -266,7 +328,9 @@ def otimizar_cesta_genetica(
     usar_penalidade_adaptativa: bool = True,
     gama: float = 2.0,
     seed: int = 42,
-    verbose: bool = True
+    verbose: bool = True,
+    meta_calorias: float = META_CALORIAS,
+    meta_proteinas: float = META_PROTEINAS
 ) -> dict:
     """
     Executa a evolução heurística do Algoritmo Genético no DEAP para encontrar
@@ -294,22 +358,32 @@ def otimizar_cesta_genetica(
             - historico_custo_real (list[float]): Custo financeiro da melhor solução
             - historico_calorias (list[float]): Calorias da melhor solução
             - historico_proteinas (list[float]): Proteínas da melhor solução
+            - historico_calorias_vazias (list[float]): % de calorias vazias da melhor solução
+            - historico_deficit_medio (list[float]): Δ nutricional médio da população
+            - historico_pct_inviaveis (list[float]): fração da população que viola restrições
+            - pct_calorias_vazias (float): % de calorias vazias da solução final
+            - meta_calorias / meta_proteinas (float): metas utilizadas
     """
     random.seed(seed)
     np.random.seed(seed)
 
-    toolbox = configurar_toolbox(precos_projetados)
+    metas = {"meta_calorias": meta_calorias, "meta_proteinas": meta_proteinas}
+
+    def _avaliar(ind, geracao=None, detalhes=False):
+        if usar_penalidade_adaptativa or detalhes:
+            return avaliar_cesta(
+                ind, precos_projetados, geracao=geracao, ngen=n_geracoes, gama=gama,
+                retornar_detalhes=detalhes, **metas
+            )
+        return avaliar_cesta(ind, precos_projetados, **metas)
+
+    toolbox = configurar_toolbox(precos_projetados, **metas)
     populacao = toolbox.population(n=n_populacao)
     hof = tools.HallOfFame(1)
 
     # Avaliação inicial (Geração 0)
     for ind in populacao:
-        if usar_penalidade_adaptativa:
-            ind.fitness.values = avaliar_cesta(
-                ind, precos_projetados, geracao=0, ngen=n_geracoes, gama=gama
-            )
-        else:
-            ind.fitness.values = avaliar_cesta(ind, precos_projetados)
+        ind.fitness.values = _avaliar(ind, geracao=0)
 
     hof.update(populacao)
 
@@ -320,16 +394,18 @@ def otimizar_cesta_genetica(
     historico_calorias = []
     historico_proteinas = []
     historico_custo_real = []
+    historico_calorias_vazias = []
+    historico_deficit_medio = []
+    historico_pct_inviaveis = []
 
     if verbose:
         print(f"\n[GA] Iniciando otimização evolutiva: {n_populacao} indivíduos, {n_geracoes} gerações.")
         print(f"[GA] Modo: {'Penalidade Adaptativa (Fase 7.3)' if usar_penalidade_adaptativa else 'Penalidade Estática'}")
+        print(f"[GA] Metas: {meta_calorias:,.0f} kcal | {meta_proteinas:,.0f} g proteína")
 
     for g in range(n_geracoes + 1):
         melhor_ind = hof[0]
-        _, detalhes_melhor = avaliar_cesta(
-            melhor_ind, precos_projetados, geracao=g, ngen=n_geracoes, gama=gama, retornar_detalhes=True
-        )
+        _, detalhes_melhor = _avaliar(melhor_ind, geracao=g, detalhes=True)
 
         fit_min = float(melhor_ind.fitness.values[0])
         fit_med = float(np.mean([ind.fitness.values[0] for ind in populacao]))
@@ -341,6 +417,12 @@ def otimizar_cesta_genetica(
         historico_calorias.append(float(detalhes_melhor["calorias"]))
         historico_proteinas.append(float(detalhes_melhor["proteinas"]))
         historico_custo_real.append(float(detalhes_melhor["custo_real"]))
+        historico_calorias_vazias.append(float(detalhes_melhor["pct_calorias_vazias"]))
+
+        # Métricas populacionais: Δ médio e fração de indivíduos inviáveis
+        deltas_pop = [calcular_metricas_nutricionais(ind, **metas)["delta_nutricional"] for ind in populacao]
+        historico_deficit_medio.append(float(np.mean(deltas_pop)))
+        historico_pct_inviaveis.append(float(np.mean([d > 0 for d in deltas_pop])))
 
         if verbose and (g % 10 == 0 or g == n_geracoes):
             status = "VÁLIDA" if detalhes_melhor["valido"] else f"Déficit: {delta_nutr*100:.1f}%"
@@ -370,36 +452,27 @@ def otimizar_cesta_genetica(
         proxima_geracao = g + 1
         for ind in offspring:
             if not ind.fitness.valid:
-                if usar_penalidade_adaptativa:
-                    ind.fitness.values = avaliar_cesta(
-                        ind, precos_projetados, geracao=proxima_geracao, ngen=n_geracoes, gama=gama
-                    )
-                else:
-                    ind.fitness.values = avaliar_cesta(ind, precos_projetados)
+                ind.fitness.values = _avaliar(ind, geracao=proxima_geracao)
 
         # 5. Filtro de Reavaliação Eficiente EXCLUSIVO para Inviáveis
         # Indivíduos que não sofreram cruzamento/mutação mantiveram o fitness da geração g.
-        # Se forem inviáveis, sua penalidade deve aumentar para refletir a geração g+1.
-        # Se forem viáveis, sua penalidade é 0 em qualquer geração, dispensando reavaliação.
+        # Se forem inviáveis (qualquer uma das 4 regras), sua penalidade deve aumentar
+        # para refletir a geração g+1. Viáveis têm penalidade 0 em qualquer geração.
         if usar_penalidade_adaptativa:
             for ind in offspring:
-                if ind.fitness.valid:
-                    cals = sum(ind[j] * TABELA_NUTRICIONAL[PRODUTOS[j]]["calorias"] for j in range(len(PRODUTOS)))
-                    prots = sum(ind[j] * TABELA_NUTRICIONAL[PRODUTOS[j]]["proteina"] for j in range(len(PRODUTOS)))
-                    if cals < META_CALORIAS or prots < META_PROTEINAS:
-                        ind.fitness.values = avaliar_cesta(
-                            ind, precos_projetados, geracao=proxima_geracao, ngen=n_geracoes, gama=gama
-                        )
+                if ind.fitness.valid and not calcular_metricas_nutricionais(ind, **metas)["valido"]:
+                    ind.fitness.values = _avaliar(ind, geracao=proxima_geracao)
 
         # 6. Atualização da População e Elitismo
         populacao[:] = offspring
+        # A penalidade do campeão inviável também deve refletir a geração corrente
+        if usar_penalidade_adaptativa and len(hof) and not calcular_metricas_nutricionais(hof[0], **metas)["valido"]:
+            hof[0].fitness.values = _avaliar(hof[0], geracao=proxima_geracao)
         hof.update(populacao)
 
     # Detalhes Finais da Melhor Solução
     melhor_solucao = hof[0]
-    _, detalhes_finais = avaliar_cesta(
-        melhor_solucao, precos_projetados, geracao=n_geracoes, ngen=n_geracoes, gama=gama, retornar_detalhes=True
-    )
+    _, detalhes_finais = _avaliar(melhor_solucao, geracao=n_geracoes, detalhes=True)
 
     return {
         "melhor_individuo": list(melhor_solucao),
@@ -407,6 +480,7 @@ def otimizar_cesta_genetica(
         "custo_total": round(detalhes_finais["custo_real"], 2),
         "calorias_totais": round(detalhes_finais["calorias"], 1),
         "proteinas_totais": round(detalhes_finais["proteinas"], 1),
+        "pct_calorias_vazias": round(detalhes_finais["pct_calorias_vazias"], 4),
         "valido": bool(detalhes_finais["valido"]),
         "delta_nutricional_final": round(detalhes_finais["delta_nutricional"], 4),
         "historico_fitness_min": historico_fitness_min,
@@ -415,8 +489,13 @@ def otimizar_cesta_genetica(
         "historico_custo_real": historico_custo_real,
         "historico_calorias": historico_calorias,
         "historico_proteinas": historico_proteinas,
+        "historico_calorias_vazias": historico_calorias_vazias,
+        "historico_deficit_medio": historico_deficit_medio,
+        "historico_pct_inviaveis": historico_pct_inviaveis,
         "n_geracoes": n_geracoes,
-        "n_populacao": n_populacao
+        "n_populacao": n_populacao,
+        "meta_calorias": meta_calorias,
+        "meta_proteinas": meta_proteinas
     }
 
 

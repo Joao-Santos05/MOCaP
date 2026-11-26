@@ -4,16 +4,25 @@ Módulo: predicao.py
 Fase 2: Módulo Preditivo de Preços com XGBoost e Integração ao DEAP (Bridge)
 """
 
+from __future__ import annotations
+
 import os
 import numpy as np
 import pandas as pd
 from xgboost import XGBRegressor
 from sklearn.metrics import root_mean_squared_error, mean_absolute_percentage_error
-from sklearn.model_selection import TimeSeriesSplit
 
 # Importações da Fase 1 (ETL e DEAP)
-from etl_genetico import carregar_dados_icb, PRODUTOS, avaliar_cesta, configurar_toolbox
-from nutricao_mock import TABELA_NUTRICIONAL
+from etl_genetico import (
+    carregar_dados_icb, PRODUTOS, avaliar_cesta, otimizar_cesta_genetica,
+    calcular_metricas_nutricionais
+)
+from nutricao_mock import TABELA_NUTRICIONAL, CESTA_PADRAO_DIEESE, META_CALORIAS, META_PROTEINAS
+
+
+def calcular_custo_cesta(cesta_kg: dict[str, float], precos: dict[str, float]) -> float:
+    """Custo total (R$) de uma cesta {produto: quantidade} dado um dicionário de preços."""
+    return float(sum(qtd * precos[p] for p, qtd in cesta_kg.items()))
 
 
 # =====================================================================
@@ -429,13 +438,31 @@ if __name__ == "__main__":
     print(">> [ASSERT OK] Estrutura do dicionário da Bridge 100% em conformidade com o DEAP.")
 
     # -----------------------------------------------------------------
-    # Teste 4: Integração de Ponta a Ponta com o Fitness do DEAP (Fase 1)
+    # Teste 4: Integração de Ponta a Ponta — DIEESE vs. DEAP (SUP_01)
     # -----------------------------------------------------------------
-    print("\n--- Teste 4: Injeção das Projeções na Função de Fitness da Fase 1 ---")
-    cesta_teste = [5] * 10  # 5 kg de cada alimento
-    custo_projetado, = avaliar_cesta(cesta_teste, precos_projetados)
-    print(f"Custo projetado para a cesta mock [5 kg x 10 produtos]: R$ {custo_projetado:.2f}")
-    print("Status da Cesta: " + ("PENALIZADA" if custo_projetado >= 10000 else "VÁLIDA (Nutricionalmente Aprovada)"))
+    print("\n--- Teste 4: Cesta Padrão DIEESE vs. Cesta Otimizada DEAP (projeção t+1) ---")
+    custo_dieese = calcular_custo_cesta(CESTA_PADRAO_DIEESE, precos_projetados)
+    nutri_dieese = calcular_metricas_nutricionais([CESTA_PADRAO_DIEESE[p] for p in PRODUTOS])
+
+    resultado = otimizar_cesta_genetica(
+        precos_projetados, n_populacao=100, n_geracoes=50, gama=2.0, seed=42, verbose=True
+    )
+    economia = custo_dieese - resultado["custo_total"]
+
+    print(f"\n{'Métrica':<28} | {'Cesta DIEESE':>14} | {'Cesta DEAP':>14}")
+    print("-" * 64)
+    print(f"{'Custo projetado (R$)':<28} | {custo_dieese:>14.2f} | {resultado['custo_total']:>14.2f}")
+    print(f"{'Calorias (kcal)':<28} | {nutri_dieese['calorias']:>14.1f} | {resultado['calorias_totais']:>14.1f}")
+    print(f"{'Proteínas (g)':<28} | {nutri_dieese['proteinas']:>14.1f} | {resultado['proteinas_totais']:>14.1f}")
+    print(f"{'Calorias vazias (%)':<28} | {nutri_dieese['pct_calorias_vazias']*100:>14.2f} | {resultado['pct_calorias_vazias']*100:>14.2f}")
+    print("-" * 64)
+    print(f"Economia: R$ {economia:.2f} ({economia / custo_dieese * 100:.2f}%)")
+    print("Composição DEAP: " + ", ".join(f"{p}={q}" for p, q in resultado["cesta_kg"].items()))
+
+    assert resultado["valido"], "FALHA: a cesta otimizada não atende às restrições nutricionais!"
+    assert resultado["calorias_totais"] >= META_CALORIAS and resultado["proteinas_totais"] >= META_PROTEINAS
+    assert resultado["custo_total"] < custo_dieese, "FALHA: a cesta DEAP deveria ser mais barata que a DIEESE!"
+    print(">> [ASSERT OK] Cesta DEAP válida e mais barata que a baseline DIEESE.")
 
     print("\n" + "=" * 80)
     print("TODOS OS TESTES DA FASE 2 FORAM CONCLUÍDOS COM SUCESSO!")
