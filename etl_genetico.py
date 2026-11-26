@@ -359,6 +359,8 @@ def otimizar_cesta_genetica(
             - historico_calorias (list[float]): Calorias da melhor solução
             - historico_proteinas (list[float]): Proteínas da melhor solução
             - historico_calorias_vazias (list[float]): % de calorias vazias da melhor solução
+            - historico_deficit_medio (list[float]): Δ nutricional médio da população
+            - historico_pct_inviaveis (list[float]): fração da população que viola restrições
             - pct_calorias_vazias (float): % de calorias vazias da solução final
             - meta_calorias / meta_proteinas (float): metas utilizadas
     """
@@ -393,6 +395,8 @@ def otimizar_cesta_genetica(
     historico_proteinas = []
     historico_custo_real = []
     historico_calorias_vazias = []
+    historico_deficit_medio = []
+    historico_pct_inviaveis = []
 
     if verbose:
         print(f"\n[GA] Iniciando otimização evolutiva: {n_populacao} indivíduos, {n_geracoes} gerações.")
@@ -414,6 +418,11 @@ def otimizar_cesta_genetica(
         historico_proteinas.append(float(detalhes_melhor["proteinas"]))
         historico_custo_real.append(float(detalhes_melhor["custo_real"]))
         historico_calorias_vazias.append(float(detalhes_melhor["pct_calorias_vazias"]))
+
+        # Métricas populacionais: Δ médio e fração de indivíduos inviáveis
+        deltas_pop = [calcular_metricas_nutricionais(ind, **metas)["delta_nutricional"] for ind in populacao]
+        historico_deficit_medio.append(float(np.mean(deltas_pop)))
+        historico_pct_inviaveis.append(float(np.mean([d > 0 for d in deltas_pop])))
 
         if verbose and (g % 10 == 0 or g == n_geracoes):
             status = "VÁLIDA" if detalhes_melhor["valido"] else f"Déficit: {delta_nutr*100:.1f}%"
@@ -481,6 +490,8 @@ def otimizar_cesta_genetica(
         "historico_calorias": historico_calorias,
         "historico_proteinas": historico_proteinas,
         "historico_calorias_vazias": historico_calorias_vazias,
+        "historico_deficit_medio": historico_deficit_medio,
+        "historico_pct_inviaveis": historico_pct_inviaveis,
         "n_geracoes": n_geracoes,
         "n_populacao": n_populacao,
         "meta_calorias": meta_calorias,

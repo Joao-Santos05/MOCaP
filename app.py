@@ -10,6 +10,7 @@ Execução:
 
 from __future__ import annotations
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -334,33 +335,97 @@ st.download_button(
 # Bloco 4 — Auditoria Evolutiva
 # ---------------------------------------------------------------------
 st.header("4. Auditoria Evolutiva (Convergência)")
-geracoes = list(range(len(resultado["historico_fitness_min"])))
+n_ger_res = len(resultado["historico_fitness_min"]) - 1
+geracoes = list(range(n_ger_res + 1))
+
+
+def grafico_convergencia(series: dict, cores: list[str], tracejados: list[bool], titulo_y: str,
+                         formato_y: str = ",.2f", log: bool = False, zero: bool = False) -> alt.Chart:
+    """Gráfico de linhas Altair com eixo X fixo [0, NGEN], cores e estilos distintos por série."""
+    df_long = pd.DataFrame({"Geração": geracoes, **series}).melt(
+        "Geração", var_name="Série", value_name="Valor"
+    )
+    nomes = list(series.keys())
+    escala_y = alt.Scale(type="symlog") if log else alt.Scale(zero=zero, nice=True)
+    return (
+        alt.Chart(df_long)
+        .mark_line(strokeWidth=2.5)
+        .encode(
+            x=alt.X("Geração:Q", scale=alt.Scale(domain=[0, n_ger_res], nice=False),
+                    axis=alt.Axis(tickMinStep=1, format="d")),
+            y=alt.Y("Valor:Q", title=titulo_y, scale=escala_y, axis=alt.Axis(format=formato_y)),
+            color=alt.Color("Série:N", scale=alt.Scale(domain=nomes, range=cores),
+                            legend=alt.Legend(orient="bottom", title=None, labelLimit=300)),
+            strokeDash=alt.StrokeDash("Série:N", scale=alt.Scale(domain=nomes,
+                                      range=[[6, 4] if t else [1, 0] for t in tracejados]), legend=None),
+            size=alt.Size("Série:N", scale=alt.Scale(domain=nomes,
+                          range=[2 if t else 4.5 for t in tracejados]), legend=None),
+            tooltip=["Geração:Q", "Série:N", alt.Tooltip("Valor:Q", format=formato_y)],
+        )
+        .properties(height=320)
+        .interactive(bind_y=False)
+    )
+
+
 g1, g2 = st.columns(2)
 
 with g1:
-    st.subheader("Melhor fitness e custo real")
-    df_fit = pd.DataFrame({
-        "Geração": geracoes,
-        "Melhor fitness (R$)": resultado["historico_fitness_min"],
-        "Custo real da melhor cesta (R$)": resultado["historico_custo_real"],
-    }).set_index("Geração")
-    st.line_chart(df_fit)
-    st.caption("Fitness = custo + penalidade adaptativa. Coincide com o custo real quando a cesta é válida.")
+    st.subheader("Custo da melhor cesta (elitismo)")
+    st.altair_chart(
+        grafico_convergencia(
+            {
+                "Melhor fitness (custo + penalidade)": resultado["historico_fitness_min"],
+                "Custo real da melhor cesta": resultado["historico_custo_real"],
+            },
+            cores=["#3b82f6", "#f28e2b"], tracejados=[False, True], titulo_y="R$",
+        ),
+        use_container_width=True,
+    )
+    st.caption(
+        "Linha azul (grossa) = fitness do melhor indivíduo (custo + penalidade); linha laranja tracejada = "
+        "custo real. Quando a melhor cesta já é válida, a penalidade é zero e as duas linhas se sobrepõem."
+    )
 
 with g2:
     st.subheader("Déficit nutricional relativo (Δ)")
-    df_def = pd.DataFrame({
-        "Geração": geracoes,
-        "Δ nutricional do melhor indivíduo": resultado["historico_deficit"],
-    }).set_index("Geração")
-    st.line_chart(df_def)
-    st.caption("Soma normalizada das violações (calorias, proteínas, calorias vazias e Arroz ≥ 0,5 × Feijão).")
+    st.altair_chart(
+        grafico_convergencia(
+            {
+                "Δ médio da população": resultado["historico_deficit_medio"],
+                "Δ do melhor indivíduo": resultado["historico_deficit"],
+            },
+            cores=["#3b82f6", "#e15759"], tracejados=[False, True], titulo_y="Δ nutricional",
+            formato_y=".3f", zero=True,
+        ),
+        use_container_width=True,
+    )
+    st.caption(
+        "Soma normalizada das violações (calorias, proteínas, calorias vazias e Arroz ≥ 0,5 × Feijão). "
+        "A penalidade adaptativa empurra a população inteira para a região viável; o melhor indivíduo fica em Δ = 0."
+    )
 
-with st.expander("Fitness médio da população"):
-    st.line_chart(pd.DataFrame({
-        "Geração": geracoes,
-        "Fitness médio (R$)": resultado["historico_fitness_med"],
-    }).set_index("Geração"))
+with st.expander("Diagnóstico da população (fração de inviáveis e fitness médio)"):
+    e1, e2 = st.columns(2)
+    with e1:
+        st.altair_chart(
+            grafico_convergencia(
+                {"Indivíduos inviáveis (%)": [v * 100 for v in resultado["historico_pct_inviaveis"]]},
+                cores=["#e15759"], tracejados=[False], titulo_y="% da população", formato_y=".0f", zero=True,
+            ),
+            use_container_width=True,
+        )
+    with e2:
+        st.altair_chart(
+            grafico_convergencia(
+                {"Fitness médio da população": resultado["historico_fitness_med"]},
+                cores=["#3b82f6"], tracejados=[False], titulo_y="R$ (escala log)", formato_y=",.0f", log=True,
+            ),
+            use_container_width=True,
+        )
+    st.caption(
+        "O fitness médio pode subir nas gerações finais: a penalidade P_base(g) cresce de R$ 500 a R$ 10.000, "
+        "então os poucos inviáveis gerados por mutação passam a pesar muito mais na média — comportamento esperado."
+    )
 
 st.divider()
 st.caption(
